@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Bot token from environment variable
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8429560559:AAFFec1INAOwPFIj6Cx1_5IzLtUGBk3br4E")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8429560559:AAEzhVnJ87oW1pDKnwTZ9mVPTSQLn2H7ZAQ")
 
 # Kasikornbank URL
 KASIKORNBANK_URL = "https://www.kasikornbank.com/en/rate/pages/foreign-exchange.aspx"
