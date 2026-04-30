@@ -8,400 +8,190 @@ Uses Kasikornbank exchange rates (Bank Buying Rate / Bank Selling Rate).
 import os
 import re
 import logging
-import requests
+import time
+import cloudscraper
 from bs4 import BeautifulSoup
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Enable logging
+# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Bot token from environment variable
+# ТОКЕН (Рекомендуется использовать переменную окружения)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8429560559:AAEzhVnJ87oW1pDKnwTZ9mVPTSQLn2H7ZAQ")
 
-# Kasikornbank URL
+# Настройки кеша
 KASIKORNBANK_URL = "https://www.kasikornbank.com/en/rate/pages/foreign-exchange.aspx"
-
-# Cache for rates (avoid hitting the site too often)
 _rates_cache = {}
 _cache_timestamp = 0
-CACHE_TTL = 300  # 5 minutes
+CACHE_TTL = 600  # 10 минут
 
-
-# ==================== EXCHANGE RATES MODULE ====================
+# ==================== МОДУЛЬ ПАРСИНГА ====================
 
 def fetch_kasikornbank_rates() -> Dict[str, Dict]:
-    """
-    Fetch exchange rates from Kasikornbank website.
-    All rates are in THB per 1 unit of foreign currency.
-    
-    Returns dict like:
-    {
-        'USD': {'name': 'US Dollar', 'buying_notes': 31.52, 'selling_notes': 32.96, 
-                'buying_telex': 32.52, 'selling_tt': 32.82},
-        ...
-    }
-    """
-    import time
     global _rates_cache, _cache_timestamp
     
-    # Check cache
     if _rates_cache and (time.time() - _cache_timestamp) < CACHE_TTL:
-        logger.info("Using cached rates")
         return _rates_cache
     
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9,th;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0',
-        }
-        
-        response = requests.get(KASIKORNBANK_URL, headers=headers, timeout=15)
+        # cloudscraper помогает обойти защиту от ботов
+        scraper = cloudscraper.create_scraper()
+        response = scraper.get(KASIKORNBANK_URL, timeout=20)
         response.raise_for_status()
 
-        soup = BeautifulSoup(response.content, 'html.parser')
-        table = soup.find('table', {'id': 'table-exchangerate'})
+        soup = BeautifulSoup(response.text, 'html.parser')
+        # Ищем таблицу по классу или ID
+        table = soup.find('table', {'id': 'table-exchangerate'}) or soup.find('table', class_='table-rate')
         
         if not table:
-            logger.error("Exchange rate table not found on page")
-            return _rates_cache  # Return old cache if available
+            logger.error("Таблица курсов не найдена на странице")
+            return _rates_cache
 
-        rates = {}
+        new_rates = {}
         rows = table.find_all('tr')
 
-        # Structure:
-        # Row 0: Header
-        # Row 1: Sub-header (EXPORT SIGHT BILL | TELEX TRANSFER | BANK NOTES | TT&DRAFT | BANK NOTES)
-        # Row 2+: Data rows (7 cells) alternating with calculator rows (1 cell)
-        
-        for row in rows[2:]:
+        for row in rows:
             cells = row.find_all('td')
-            if len(cells) != 7:
+            if len(cells) < 6:
                 continue
 
-            # First cell: currency code and name
-            first_cell_text = cells[0].get_text(separator='|', strip=True)
-            match = re.match(r'([A-Z]{3})', first_cell_text)
+            # Извлекаем код валюты (например, USD)
+            text = cells[0].get_text(strip=True)
+            match = re.search(r'([A-Z]{3})', text)
             if not match:
                 continue
-
-            currency_code = match.group(1)
             
-            # Get currency name
-            parts = first_cell_text.split('|')
-            if len(parts) >= 2:
-                name_part = parts[1].strip()
-                if ':' in name_part:
-                    currency_name = currency_code
-                else:
-                    currency_name = name_part
-            else:
-                currency_name = currency_code
-
-            # Skip duplicate USD entries (USD 5-20, USD 50-100)
-            if currency_code == 'USD' and 'USD' in rates:
+            code = match.group(1)
+            
+            # Пропускаем дубликаты USD (у банка их несколько для разных купюр)
+            if code == 'USD' and code in new_rates:
                 continue
-            if currency_code == 'USD':
-                currency_name = "US Dollar"
 
-            def parse_rate(cell_text):
-                text = cell_text.strip()
-                if text in ('-', '', 'N/A'):
-                    return None
+            def to_float(val):
                 try:
-                    return float(text)
-                except ValueError:
+                    return float(val.get_text(strip=True).replace(',', ''))
+                except (ValueError, AttributeError):
                     return None
 
-            # Bank Buying Rate columns (bank buys foreign currency from you):
-            buying_sight = parse_rate(cells[1].get_text(strip=True))    # Export Sight Bill
-            buying_telex = parse_rate(cells[2].get_text(strip=True))    # Telex Transfer
-            buying_notes = parse_rate(cells[3].get_text(strip=True))    # Bank Notes (Buy)
-            
-            # Bank Selling Rate columns (bank sells foreign currency to you):
-            selling_tt = parse_rate(cells[4].get_text(strip=True))      # TT&Draft T/Cheques
-            selling_notes = parse_rate(cells[5].get_text(strip=True))   # Bank Notes (Sell)
+            # Индексы могут меняться, но обычно: 
+            # 3 - Buying Notes, 5 - Selling Notes
+            new_rates[code] = {
+                'name': code,
+                'buying_notes': to_float(cells[3]),
+                'selling_notes': to_float(cells[5]),
+                'buying_telex': to_float(cells[2]),
+                'selling_tt': to_float(cells[4])
+            }
 
-            if buying_notes or buying_telex or buying_sight or selling_tt or selling_notes:
-                rates[currency_code] = {
-                    'name': currency_name,
-                    'buying_sight': buying_sight,
-                    'buying_telex': buying_telex,
-                    'buying_notes': buying_notes,
-                    'selling_tt': selling_tt,
-                    'selling_notes': selling_notes,
-                }
-
-        if rates:
-            _rates_cache = rates
+        if new_rates:
+            _rates_cache = new_rates
             _cache_timestamp = time.time()
-            logger.info(f"Successfully fetched {len(rates)} currencies from Kasikornbank")
-        
-        return rates
-
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP Error fetching Kasikornbank: {e}")
-        return _rates_cache
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request error fetching Kasikornbank: {e}")
-        return _rates_cache
+            return new_rates
+            
     except Exception as e:
-        logger.error(f"Error parsing Kasikornbank: {e}")
-        return _rates_cache
-
+        logger.error(f"Ошибка парсинга: {e}")
+    
+    return _rates_cache
 
 def convert_currency(amount: float, from_curr: str, to_curr: str) -> Optional[Dict]:
-    """
-    Convert amount between currencies using Kasikornbank rates.
-    All rates are in THB per 1 unit of foreign currency.
+    rates = fetch_kasikornbank_rates()
+    if not rates: return None
+
+    from_curr, to_curr = from_curr.upper(), to_curr.upper()
     
-    Logic:
-    - If converting FROM foreign currency TO THB: use Bank Buying Rate (bank buys from you)
-    - If converting FROM THB TO foreign currency: use Bank Selling Rate (bank sells to you)
-    - If converting between two foreign currencies: go through THB
-    """
-    rates = fetch_kasikornbank_rates()
-    if not rates:
-        return None
-
-    from_curr = from_curr.upper()
-    to_curr = to_curr.upper()
-
-    # Validate currencies
-    if from_curr != 'THB' and from_curr not in rates:
-        return None
-    if to_curr != 'THB' and to_curr not in rates:
-        return None
-
-    result = None
-    rate_info = ""
-
-    if from_curr == 'THB' and to_curr == 'THB':
-        result = amount
-        rate_info = "1.0"
-    elif from_curr == 'THB':
-        # THB -> Foreign: use Bank Selling Rate (bank sells foreign to you)
-        to_data = rates[to_curr]
-        sell_rate = to_data['selling_notes'] or to_data['selling_tt']
-        if sell_rate and sell_rate > 0:
-            result = amount / sell_rate
-            rate_info = f"1 {to_curr} = {sell_rate} THB (Sell)"
+    # Логика конвертации через THB
+    try:
+        # 1. Переводим из валюты А в баты (банк покупает у нас)
+        if from_curr == 'THB':
+            thb_amount = amount
         else:
-            return None
-    elif to_curr == 'THB':
-        # Foreign -> THB: use Bank Buying Rate (bank buys foreign from you)
-        from_data = rates[from_curr]
-        buy_rate = from_data['buying_notes'] or from_data['buying_telex'] or from_data['buying_sight']
-        if buy_rate and buy_rate > 0:
-            result = amount * buy_rate
-            rate_info = f"1 {from_curr} = {buy_rate} THB (Buy)"
-        else:
-            return None
-    else:
-        # Foreign -> Foreign: go through THB
-        # Step 1: from_curr -> THB (bank buys from_curr from you)
-        from_data = rates[from_curr]
-        buy_rate = from_data['buying_notes'] or from_data['buying_telex'] or from_data['buying_sight']
-        
-        # Step 2: THB -> to_curr (bank sells to_curr to you)
-        to_data = rates[to_curr]
-        sell_rate = to_data['selling_notes'] or to_data['selling_tt']
-        
-        if buy_rate and sell_rate and buy_rate > 0 and sell_rate > 0:
-            thb_amount = amount * buy_rate
-            result = thb_amount / sell_rate
-            cross_rate = buy_rate / sell_rate
-            rate_info = f"1 {from_curr} = {cross_rate:.6f} {to_curr}"
-        else:
-            return None
+            data = rates.get(from_curr)
+            rate = data['buying_notes'] or data['buying_telex']
+            thb_amount = amount * rate
 
-    if result is not None:
+        # 2. Переводим из батов в валюту Б (банк продает нам)
+        if to_curr == 'THB':
+            result = thb_amount
+            rate_info = f"1 {from_curr} = {thb_amount/amount:.2f} THB"
+        else:
+            data = rates.get(to_curr)
+            rate = data['selling_notes'] or data['selling_tt']
+            result = thb_amount / rate
+            rate_info = f"Курс через THB (Sell: {rate})"
+
         return {
-            'amount': amount,
-            'from': from_curr,
-            'to': to_curr,
-            'result': round(result, 4),
-            'rate_info': rate_info
+            'amount': amount, 'from': from_curr, 'to': to_curr,
+            'result': round(result, 2), 'rate_info': rate_info
         }
-    return None
+    except:
+        return None
 
+# ==================== ХЕНДЛЕРЫ БОТА ====================
 
-# ==================== BOT HANDLERS ====================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /start is issued."""
-    user = update.effective_user
-    welcome_message = (
-        f"Привет, {user.mention_html()}! 👋\n\n"
-        f"Я <b>CANOPUS</b> — бот для конвертации валют.\n\n"
-        f"💱 Курсы валют берутся с сайта Kasikornbank\n"
-        f"🏦 Источник: kasikornbank.com\n\n"
-        f"Используйте /help для списка доступных команд."
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_html(
+        "👋 <b>Привет! Я CANOPUS.</b>\n\n"
+        "Я подскажу актуальный курс в <b>Kasikornbank (Тайланд)</b>.\n"
+        "Используй /rates чтобы увидеть курсы или\n"
+        "<code>/convert 100 USD THB</code> для расчета."
     )
-    await update.message.reply_html(welcome_message)
-    logger.info(f"User {user.id} started the bot")
 
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /help is issued."""
-    help_text = (
-        "📋 <b>Доступные команды:</b>\n\n"
-        "/start — Приветственное сообщение\n"
-        "/help — Список доступных команд\n"
-        "/rates — Показать курсы валют Kasikornbank\n"
-        "/convert — Пересчет валют\n\n"
-        "💱 <b>Примеры использования /convert:</b>\n"
-        "<code>/convert 100 USD THB</code> — 100 долларов в баты\n"
-        "<code>/convert 5000 THB USD</code> — 5000 батов в доллары\n"
-        "<code>/convert 100 USD EUR</code> — 100 долларов в евро\n"
-        "<code>/convert 1000 EUR THB</code> — 1000 евро в баты\n\n"
-        "📊 <b>Столбцы курсов:</b>\n"
-        "• <b>Buy</b> — банк покупает у вас (Bank Buying Rate)\n"
-        "• <b>Sell</b> — банк продает вам (Bank Selling Rate)\n\n"
-        "💬 Отправьте любое текстовое сообщение — я его повторю."
-    )
-    await update.message.reply_html(help_text)
-
-
-async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show current exchange rates from Kasikornbank."""
-    await update.message.reply_text("⏳ Загружаю курсы с Kasikornbank...")
-
+async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_chat_action("typing")
     rates = fetch_kasikornbank_rates()
+    
     if not rates:
-        await update.message.reply_text(
-            "❌ Не удалось получить курсы валют с Kasikornbank.\n"
-            "Попробуйте позже или проверьте сайт:\n"
-            "https://www.kasikornbank.com/en/rate/pages/foreign-exchange.aspx"
-        )
+        await update.message.reply_text("❌ Ошибка связи с банком. Попробуйте позже.")
         return
 
-    text = "📊 <b>Курсы валют Kasikornbank</b>\n"
-    text += "<i>(THB за 1 единицу валюты)</i>\n\n"
+    msg = "📊 <b>Курсы Kasikornbank (Наличные)</b>\n\n"
+    msg += "<code>Валюта | Купить | Продать</code>\n"
+    msg += "<code>-----------------------</code>\n"
     
-    # Show main currencies first
-    main_currencies = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD', 'SGD', 'CNY', 'MYR', 'HKD', 'NZD']
-    
-    text += "<code>      Buy Notes  Sell Notes</code>\n"
-    text += "<code>      (банк пок) (банк прод)</code>\n"
-    text += "<code>─────────────────────────────</code>\n"
-
-    shown = set()
-    for code in main_currencies:
+    for code in ['USD', 'EUR', 'GBP', 'JPY', 'RUB', 'CNY']:
         if code in rates:
-            data = rates[code]
-            bn = f"{data['buying_notes']:.4f}" if data['buying_notes'] else "   -   "
-            sn = f"{data['selling_notes']:.4f}" if data['selling_notes'] else "   -   "
-            text += f"<code>{code:4s} {bn:>10s} {sn:>10s}</code>\n"
-            shown.add(code)
+            r = rates[code]
+            bn = r['buying_notes'] or "—"
+            sn = r['selling_notes'] or "—"
+            msg += f"<code>{code:6} | {bn:6} | {sn:6}</code>\n"
+            
+    msg += "\nПосмотреть все: /help"
+    await update.message.reply_html(msg)
 
-    # Show remaining currencies
-    remaining = [c for c in sorted(rates.keys()) if c not in shown]
-    if remaining:
-        text += f"\n<code>─── Другие валюты ───</code>\n"
-        for code in remaining:
-            data = rates[code]
-            bn = f"{data['buying_notes']:.4f}" if data['buying_notes'] else "   -   "
-            sn = f"{data['selling_notes']:.4f}" if data['selling_notes'] else "   -   "
-            text += f"<code>{code:4s} {bn:>10s} {sn:>10s}</code>\n"
-
-    text += f"\n📌 Всего валют: {len(rates)}\n"
-    text += "🏦 Источник: Kasikornbank\n"
-    text += "\nИспользуйте: <code>/convert сумма ВАЛЮТА1 ВАЛЮТА2</code>"
-
-    await update.message.reply_html(text)
-
-
-async def convert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /convert command for currency conversion."""
-    if not context.args or len(context.args) < 3:
-        await update.message.reply_html(
-            "❌ <b>Неверный формат</b>\n\n"
-            "Использование: <code>/convert сумма ВАЛЮТА1 ВАЛЮТА2</code>\n\n"
-            "Примеры:\n"
-            "<code>/convert 100 USD THB</code> — продать 100$ банку\n"
-            "<code>/convert 5000 THB USD</code> — купить доллары за 5000 батов\n"
-            "<code>/convert 100 USD EUR</code> — пересчет через THB\n\n"
-            "Доступные валюты: /rates"
-        )
+async def convert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 3:
+        await update.message.reply_text("Пример: /convert 100 USD THB")
         return
 
     try:
-        amount = float(context.args[0].replace(',', ''))
-        from_currency = context.args[1].upper()
-        to_currency = context.args[2].upper()
-
-        if amount <= 0:
-            await update.message.reply_text("❌ Сумма должна быть больше 0")
-            return
-
-        result = convert_currency(amount, from_currency, to_currency)
-
-        if result:
-            text = (
-                f"💱 <b>Конвертация валют (Kasikornbank)</b>\n\n"
-                f"<code>{result['amount']:,.2f} {result['from']} = {result['result']:,.4f} {result['to']}</code>\n\n"
-                f"📈 {result['rate_info']}\n"
-                f"🏦 Источник: Kasikornbank"
-            )
-            await update.message.reply_html(text)
-        else:
-            rates = fetch_kasikornbank_rates()
-            available = ', '.join(sorted(rates.keys())) if rates else "нет данных"
+        amount = float(context.args[0])
+        res = convert_currency(amount, context.args[1], context.args[2])
+        if res:
             await update.message.reply_html(
-                f"❌ Не удалось конвертировать <b>{from_currency}</b> → <b>{to_currency}</b>.\n\n"
-                f"Доступные валюты: {available}\n"
-                f"Также можно использовать: <b>THB</b>\n\n"
-                f"Используйте /rates для списка курсов."
+                f"✅ <b>Результат:</b>\n"
+                f"<code>{res['amount']} {res['from']} = {res['result']} {res['to']}</code>\n\n"
+                f"ℹ️ {res['rate_info']}"
             )
-
+        else:
+            await update.message.reply_text("❌ Валюта не найдена.")
     except ValueError:
-        await update.message.reply_text("❌ Неверная сумма. Введите число.\n\nПример: /convert 100 USD THB")
-    except Exception as e:
-        logger.error(f"Error in convert_command: {e}")
-        await update.message.reply_text("❌ Произошла ошибка. Попробуйте позже.")
+        await update.message.reply_text("Введите число.")
 
-
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Echo the user message."""
-    await update.message.reply_text(f"Вы написали: {update.message.text}")
-
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log errors."""
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
-
-
-def main() -> None:
-    """Start the bot."""
-    logger.info("Starting CANOPUS bot...")
-
+def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("rates", rates_command))
     application.add_handler(CommandHandler("convert", convert_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-    application.add_error_handler(error_handler)
 
-    logger.info("CANOPUS bot is running!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    logger.info("Бот запущен...")
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
